@@ -1,34 +1,64 @@
 import { FastMCP } from "fastmcp";
 import { z } from "zod";
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 
 const mcp = new FastMCP({
   name: "microsoft-planner-mcp",
   version: "1.0.0",
 });
 
-// Helper to execute az rest commands
-function azRest(method: string, url: string, body?: object): string {
-  const args = [`az rest --method ${method} --url "${url}"`];
-  if (body) {
-    const bodyJson = JSON.stringify(body).replace(/"/g, '\\"');
-    args.push(`--headers "Content-Type=application/json" --body "${bodyJson}"`);
-  }
+const GRAPH = "https://graph.microsoft.com/v1.0";
+
+// IDs do Planner/Graph: apenas letras, números, "-" e "_" (evita injeção em URL/argumentos)
+const idSchema = (description: string) =>
+  z
+    .string()
+    .regex(/^[A-Za-z0-9_-]{1,128}$/, "Invalid ID format")
+    .describe(description);
+
+const categorySchema = z
+  .string()
+  .regex(/^category([1-9]|1[0-9]|2[0-5])$/, "Must be category1 to category25");
+
+// Executa `az` SEM shell: cada argumento é passado de forma literal (sem interpretação de shell)
+function runAz(args: string[]): string {
   try {
-    const result = execSync(args.join(" "), { encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 });
-    return result;
+    return execFileSync("az", args, {
+      encoding: "utf-8",
+      maxBuffer: 10 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
   } catch (error: any) {
-    throw new Error(`az rest failed: ${error.message}`);
+    // Não ecoa o comando completo; devolve só a primeira linha do stderr
+    const stderr = String(error?.stderr ?? "").trim().split("\n")[0];
+    throw new Error(`az rest failed${stderr ? `: ${stderr}` : ""}`);
   }
+}
+
+// Helper to execute az rest commands
+function azRest(
+  method: string,
+  url: string,
+  body?: object,
+  headers: string[] = []
+): string {
+  const args = ["rest", "--method", method, "--url", url];
+  const allHeaders = [...headers];
+  if (body) allHeaders.unshift("Content-Type=application/json");
+  if (allHeaders.length) args.push("--headers", ...allHeaders);
+  if (body) args.push("--body", JSON.stringify(body));
+  return runAz(args);
 }
 
 // Helper to get ETag for update/delete operations
 function getETag(taskId: string, isDetails: boolean = false): string {
   const url = isDetails
-    ? `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}/details`
-    : `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}`;
+    ? `${GRAPH}/planner/tasks/${taskId}/details`
+    : `${GRAPH}/planner/tasks/${taskId}`;
   const result = JSON.parse(azRest("GET", url));
-  return result["@odata.etag"];
+  const etag = result["@odata.etag"];
+  if (typeof etag !== "string") throw new Error("ETag not found in response");
+  return etag;
 }
 
 // Tool: List tasks for a plan
@@ -36,11 +66,10 @@ mcp.addTool({
   name: "list-tasks",
   description: "List all tasks in a Planner plan",
   parameters: z.object({
-    planId: z.string().describe("The Planner plan ID"),
+    planId: idSchema("The Planner plan ID"),
   }),
   execute: async ({ planId }) => {
-    const url = `https://graph.microsoft.com/v1.0/planner/plans/${planId}/tasks`;
-    const result = JSON.parse(azRest("GET", url));
+    const result = JSON.parse(azRest("GET", `${GRAPH}/planner/plans/${planId}/tasks`));
     return JSON.stringify(result.value, null, 2);
   },
 });
@@ -50,13 +79,9 @@ mcp.addTool({
   name: "get-task",
   description: "Get details of a specific Planner task",
   parameters: z.object({
-    taskId: z.string().describe("The task ID"),
+    taskId: idSchema("The task ID"),
   }),
-  execute: async ({ taskId }) => {
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}`;
-    const result = azRest("GET", url);
-    return result;
-  },
+  execute: async ({ taskId }) => azRest("GET", `${GRAPH}/planner/tasks/${taskId}`),
 });
 
 // Tool: Get task details (description, checklist, references)
@@ -64,13 +89,9 @@ mcp.addTool({
   name: "get-task-details",
   description: "Get extended task details including description and checklist",
   parameters: z.object({
-    taskId: z.string().describe("The task ID"),
+    taskId: idSchema("The task ID"),
   }),
-  execute: async ({ taskId }) => {
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}/details`;
-    const result = azRest("GET", url);
-    return result;
-  },
+  execute: async ({ taskId }) => azRest("GET", `${GRAPH}/planner/tasks/${taskId}/details`),
 });
 
 // Tool: Create task
@@ -78,16 +99,12 @@ mcp.addTool({
   name: "create-task",
   description: "Create a new task in a Planner plan",
   parameters: z.object({
-    planId: z.string().describe("The plan ID"),
-    bucketId: z.string().describe("The bucket ID"),
-    title: z.string().describe("Task title"),
+    planId: idSchema("The plan ID"),
+    bucketId: idSchema("The bucket ID"),
+    title: z.string().min(1).max(256).describe("Task title"),
   }),
-  execute: async ({ planId, bucketId, title }) => {
-    const url = "https://graph.microsoft.com/v1.0/planner/tasks";
-    const body = { planId, bucketId, title };
-    const result = azRest("POST", url, body);
-    return result;
-  },
+  execute: async ({ planId, bucketId, title }) =>
+    azRest("POST", `${GRAPH}/planner/tasks`, { planId, bucketId, title }),
 });
 
 // Tool: Update task (title, percentComplete, assignments, categories)
@@ -95,11 +112,11 @@ mcp.addTool({
   name: "update-task",
   description: "Update task properties (title, progress, assignments, categories). Auto-fetches ETag.",
   parameters: z.object({
-    taskId: z.string().describe("The task ID"),
-    title: z.string().optional().describe("New title"),
+    taskId: idSchema("The task ID"),
+    title: z.string().min(1).max(256).optional().describe("New title"),
     percentComplete: z.number().min(0).max(100).optional().describe("Progress 0-100"),
-    assignUserId: z.string().optional().describe("User ID to assign"),
-    category: z.string().optional().describe("Category to apply (category1-category25)"),
+    assignUserId: idSchema("User ID to assign").optional(),
+    category: categorySchema.optional().describe("Category to apply (category1-category25)"),
   }),
   execute: async ({ taskId, title, percentComplete, assignUserId, category }) => {
     const etag = getETag(taskId);
@@ -118,20 +135,10 @@ mcp.addTool({
       body.appliedCategories = { [category]: true };
     }
 
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}`;
-    // Escape the inner quotes in the ETag for shell: W/"..." -> W/\"...\"
-    const escapedEtag = etag.replace(/"/g, '\\"');
-    const args = [
-      `az rest --method PATCH --url "${url}"`,
-      `--headers "Content-Type=application/json" "If-Match=${escapedEtag}"`,
-      `--body '${JSON.stringify(body)}'`,
-    ];
-    try {
-      const result = execSync(args.join(" "), { encoding: "utf-8" });
-      return result || "Task updated successfully";
-    } catch (error: any) {
-      throw new Error(`Update failed: ${error.message}`);
-    }
+    const result = azRest("PATCH", `${GRAPH}/planner/tasks/${taskId}`, body, [
+      `If-Match=${etag}`,
+    ]);
+    return result || "Task updated successfully";
   },
 });
 
@@ -140,25 +147,21 @@ mcp.addTool({
   name: "update-task-details",
   description: "Update task description (use for GitHub links). Auto-fetches ETag.",
   parameters: z.object({
-    taskId: z.string().describe("The task ID"),
-    description: z.string().describe("Task description (supports markdown, include GitHub URLs)"),
+    taskId: idSchema("The task ID"),
+    description: z
+      .string()
+      .max(32768)
+      .describe("Task description (supports markdown, include GitHub URLs)"),
   }),
   execute: async ({ taskId, description }) => {
     const etag = getETag(taskId, true);
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}/details`;
-    // Escape the inner quotes in the ETag for shell: W/"..." -> W/\"...\"
-    const escapedEtag = etag.replace(/"/g, '\\"');
-    const args = [
-      `az rest --method PATCH --url "${url}"`,
-      `--headers "Content-Type=application/json" "If-Match=${escapedEtag}"`,
-      `--body '${JSON.stringify({ description })}'`,
-    ];
-    try {
-      const result = execSync(args.join(" "), { encoding: "utf-8" });
-      return result || "Task details updated successfully";
-    } catch (error: any) {
-      throw new Error(`Update details failed: ${error.message}`);
-    }
+    const result = azRest(
+      "PATCH",
+      `${GRAPH}/planner/tasks/${taskId}/details`,
+      { description },
+      [`If-Match=${etag}`]
+    );
+    return result || "Task details updated successfully";
   },
 });
 
@@ -167,23 +170,12 @@ mcp.addTool({
   name: "delete-task",
   description: "Delete a Planner task. Auto-fetches ETag.",
   parameters: z.object({
-    taskId: z.string().describe("The task ID to delete"),
+    taskId: idSchema("The task ID to delete"),
   }),
   execute: async ({ taskId }) => {
     const etag = getETag(taskId);
-    const url = `https://graph.microsoft.com/v1.0/planner/tasks/${taskId}`;
-    // Escape the inner quotes in the ETag for shell: W/"..." -> W/\"...\"
-    const escapedEtag = etag.replace(/"/g, '\\"');
-    const args = [
-      `az rest --method DELETE --url "${url}"`,
-      `--headers "If-Match=${escapedEtag}"`,
-    ];
-    try {
-      execSync(args.join(" "), { encoding: "utf-8" });
-      return "Task deleted successfully";
-    } catch (error: any) {
-      throw new Error(`Delete failed: ${error.message}`);
-    }
+    azRest("DELETE", `${GRAPH}/planner/tasks/${taskId}`, undefined, [`If-Match=${etag}`]);
+    return "Task deleted successfully";
   },
 });
 
@@ -192,11 +184,10 @@ mcp.addTool({
   name: "list-buckets",
   description: "List all buckets in a Planner plan",
   parameters: z.object({
-    planId: z.string().describe("The Planner plan ID"),
+    planId: idSchema("The Planner plan ID"),
   }),
   execute: async ({ planId }) => {
-    const url = `https://graph.microsoft.com/v1.0/planner/plans/${planId}/buckets`;
-    const result = JSON.parse(azRest("GET", url));
+    const result = JSON.parse(azRest("GET", `${GRAPH}/planner/plans/${planId}/buckets`));
     return JSON.stringify(result.value, null, 2);
   },
 });
@@ -207,8 +198,7 @@ mcp.addTool({
   description: "List all Planner plans accessible to the current user",
   parameters: z.object({}),
   execute: async () => {
-    const url = "https://graph.microsoft.com/v1.0/me/planner/plans";
-    const result = JSON.parse(azRest("GET", url));
+    const result = JSON.parse(azRest("GET", `${GRAPH}/me/planner/plans`));
     return JSON.stringify(result.value, null, 2);
   },
 });
