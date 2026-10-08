@@ -2,6 +2,8 @@
 
 Lightweight MCP (Model Context Protocol) server for Microsoft Planner that uses `az rest` for authentication instead of complex OAuth flows.
 
+> **Fork notice:** this is a fork of [vyente-ruffin/microsoft-planner-mcp](https://github.com/vyente-ruffin/microsoft-planner-mcp) with security fixes: command injection removed (`az` is now run via `execFileSync` without a shell), strict input validation for IDs/categories, sanitized error messages, and updated dependencies.
+
 ## What This Is
 
 A minimal MCP server that enables Claude Code to interact with Microsoft Planner tasks directly. It leverages Azure CLI's existing authentication (`az login`) to make Graph API calls, eliminating the need for app registrations or token management.
@@ -17,7 +19,7 @@ A minimal MCP server that enables Claude Code to interact with Microsoft Planner
 ## Installation
 
 ```bash
-git clone https://github.com/vyente-ruffin/microsoft-planner-mcp.git
+git clone https://github.com/l-miranda-coinov/microsoft-planner-mcp.git
 cd microsoft-planner-mcp
 npm install
 npm run build
